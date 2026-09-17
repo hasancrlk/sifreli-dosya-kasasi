@@ -1,20 +1,19 @@
 """
 VaultCore Application Configuration.
 
-Centralized configuration management using pydantic-settings.
-All sensitive values are loaded from environment variables.
+All sensitive values come from environment variables; nothing secret has a default.
 """
 
 from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    # Database
-    DATABASE_URL: str = "postgresql+asyncpg://vaultcore:vaultcore_secret@localhost:5432/vaultcore_db"
-    DATABASE_URL_SYNC: str = "postgresql://vaultcore:vaultcore_secret@localhost:5432/vaultcore_db"
+    # Database (required — no credentials baked into code)
+    DATABASE_URL: str
 
     # Application
     APP_HOST: str = "0.0.0.0"
@@ -22,20 +21,31 @@ class Settings(BaseSettings):
     APP_ENV: str = "production"
     DEBUG: bool = False
 
+    # Authentication for management endpoints (upload/list/delete)
+    API_KEY: str = ""
+
     # File Storage
     ENCRYPTED_FILES_DIR: str = "./encrypted_files"
+    MAX_FILE_SIZE_MB: int = 100
+    CLEANUP_INTERVAL_MINUTES: int = 60
 
-    # Rate Limiting (per file_id for download endpoint)
+    # Rate limiting — use redis:// when running more than one worker
+    RATE_LIMIT_STORAGE_URI: str = "memory://"
     RATE_LIMIT_DOWNLOAD: str = "5/minute"
     RATE_LIMIT_UPLOAD: str = "10/minute"
 
-    # Argon2id KDF Parameters (OWASP recommended)
-    ARGON2_TIME_COST: int = 3
-    ARGON2_MEMORY_COST: int = 65536  # 64 MB
-    ARGON2_PARALLELISM: int = 4
+    # Per-file brute-force lockout (enforced in the DB, works across workers)
+    MAX_FAILED_ATTEMPTS: int = 5
+    LOCKOUT_MINUTES: int = 15
 
-    # File Limits
-    MAX_FILE_SIZE_MB: int = 100
+    # Password policy
+    MIN_PASSWORD_LENGTH: int = 12
+
+    # Argon2id KDF parameters for NEW files (stored per file, so changing them is safe)
+    ARGON2_TIME_COST: int = 3
+    ARGON2_MEMORY_COST: int = 65536  # KiB = 64 MB
+    ARGON2_PARALLELISM: int = 4
+    KDF_MAX_CONCURRENCY: int = 4  # caps KDF memory use per worker
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -51,6 +61,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
+        extra="ignore",
     )
 
 

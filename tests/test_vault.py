@@ -27,7 +27,7 @@ import os
 from unittest.mock import patch
 
 import pytest
-import pytest_asyncio
+from cryptography.exceptions import InvalidTag
 
 from app.crypto.engine import (
     NONCE_SIZE,
@@ -37,8 +37,7 @@ from app.crypto.engine import (
     derive_key,
     encrypt,
 )
-from cryptography.exceptions import InvalidTag
-
+from tests.conftest import STRONG_PASSWORD
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CRYPTOGRAPHIC UNIT TESTS
@@ -212,7 +211,7 @@ class TestUploadEndpoint:
         response = await client.post(
             "/api/v1/vault/upload",
             files={"file": ("test.txt", b"Hello World", "text/plain")},
-            data={"password": "my_secure_password"},
+            data={"password": STRONG_PASSWORD},
         )
 
         assert response.status_code == 201
@@ -227,7 +226,7 @@ class TestUploadEndpoint:
         response = await client.post(
             "/api/v1/vault/upload",
             files={"file": ("test.txt", b"content", "text/plain")},
-            data={"password": "password", "max_downloads": "1"},
+            data={"password": STRONG_PASSWORD, "max_downloads": "1"},
         )
 
         assert response.status_code == 201
@@ -238,7 +237,7 @@ class TestUploadEndpoint:
         response = await client.post(
             "/api/v1/vault/upload",
             files={"file": ("test.txt", b"content", "text/plain")},
-            data={"password": "password", "expires_in_hours": "24"},
+            data={"password": STRONG_PASSWORD, "expires_in_hours": "24"},
         )
 
         assert response.status_code == 201
@@ -249,7 +248,7 @@ class TestUploadEndpoint:
         response = await client.post(
             "/api/v1/vault/upload",
             files={"file": ("empty.txt", b"", "text/plain")},
-            data={"password": "password"},
+            data={"password": STRONG_PASSWORD},
         )
 
         assert response.status_code == 400
@@ -271,7 +270,7 @@ class TestDownloadEndpoint:
     async def test_download_with_correct_password(self, client):
         """Download with correct password returns original content."""
         original_content = b"This is my secret file content!"
-        password = "correct_password_123"
+        password = STRONG_PASSWORD
 
         # Upload
         upload_resp = await client.post(
@@ -297,7 +296,7 @@ class TestDownloadEndpoint:
         upload_resp = await client.post(
             "/api/v1/vault/upload",
             files={"file": ("test.txt", b"secret", "text/plain")},
-            data={"password": "correct_password"},
+            data={"password": STRONG_PASSWORD},
         )
         file_id = upload_resp.json()["id"]
 
@@ -324,7 +323,7 @@ class TestDownloadEndpoint:
 
     async def test_one_time_download(self, client):
         """File with max_downloads=1 becomes unavailable after first download."""
-        password = "otp_password"
+        password = STRONG_PASSWORD
 
         # Upload with max_downloads=1
         upload_resp = await client.post(
@@ -351,7 +350,7 @@ class TestDownloadEndpoint:
     async def test_download_binary_file(self, client):
         """Binary file (e.g., image) roundtrip should preserve content exactly."""
         binary_content = os.urandom(4096)  # Random binary data
-        password = "binary_pass"
+        password = STRONG_PASSWORD
 
         upload_resp = await client.post(
             "/api/v1/vault/upload",
@@ -388,7 +387,7 @@ class TestListFilesEndpoint:
         await client.post(
             "/api/v1/vault/upload",
             files={"file": ("listed.txt", b"content", "text/plain")},
-            data={"password": "password"},
+            data={"password": STRONG_PASSWORD},
         )
 
         response = await client.get("/api/v1/vault/files")
@@ -402,7 +401,7 @@ class TestListFilesEndpoint:
         await client.post(
             "/api/v1/vault/upload",
             files={"file": ("safe.txt", b"content", "text/plain")},
-            data={"password": "super_secret_password"},
+            data={"password": STRONG_PASSWORD},
         )
 
         response = await client.get("/api/v1/vault/files")
@@ -431,7 +430,7 @@ class TestListFilesEndpoint:
             await client.post(
                 "/api/v1/vault/upload",
                 files={"file": (f"file_{i}.txt", f"content_{i}".encode(), "text/plain")},
-                data={"password": f"password_{i}"},
+                data={"password": STRONG_PASSWORD},
             )
 
         response = await client.get("/api/v1/vault/files")

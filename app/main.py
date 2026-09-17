@@ -5,13 +5,13 @@ FastAPI application factory with security middleware, rate limiting,
 structured logging, and lifecycle management.
 """
 
+import asyncio
 import logging
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -19,8 +19,8 @@ from slowapi.errors import RateLimitExceeded
 from app.api.dependencies import limiter
 from app.api.routes import router as vault_router
 from app.config import settings
-from app.database import close_db, init_db
-
+from app.database import async_session_factory, close_db, init_db
+from app.services.vault_service import VaultService
 
 # ─── Logging Configuration ───────────────────────────────────────────────────
 
@@ -48,6 +48,18 @@ logger = logging.getLogger(__name__)
 # ─── Application Lifecycle ───────────────────────────────────────────────────
 
 
+async def _cleanup_loop() -> None:
+    """Periodically delete ciphertext of expired/used-up files and orphans."""
+    while True:
+        try:
+            async with async_session_factory() as session:
+                await VaultService(session).purge_unavailable()
+        except Exception:
+            logger.exception("Cleanup job failed")
+        await asyncio.sleep(settings.CLEANUP_INTERVAL_MINUTES * 60)
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle manager: startup and shutdown hooks."""
@@ -58,10 +70,15 @@ async def lifespan(app: FastAPI):
     # Initialize database tables
     await init_db()
     logger.info("Database initialized")
+    if not settings.API_KEY:
+        logger.warning("API_KEY is not set: upload/list/delete endpoints are disabled")
 
+    cleanup = asyncio.create_task(_cleanup_loop())
     yield
 
-    # Cleanup
+    cleanup.cancel()
+    with suppress(asyncio.CancelledError):
+        await cleanup
     await close_db()
     logger.info("VaultCore shut down gracefully")
 
@@ -72,9 +89,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="VaultCore",
     description=(
-        "Zero-Knowledge Encrypted File Storage Service. "
-        "Files are encrypted with AES-256-GCM using Argon2id-derived keys. "
-        "Passwords are NEVER stored — only used transiently for key derivation."
+        "Password-protected encrypted file storage. Files are encrypted server-side "
+        "with AES-256-GCM using Argon2id-derived keys; passwords are never stored."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -94,8 +110,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if settings.DEBUG else [],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Accept"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type", "Accept", "X-API-Key"],
 )
 
 # Security headers middleware
@@ -105,7 +121,6 @@ async def security_headers_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Content-Security-Policy"] = "default-src 'none'"
     response.headers["Referrer-Policy"] = "no-referrer"

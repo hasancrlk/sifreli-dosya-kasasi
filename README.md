@@ -1,4 +1,4 @@
-# 🔐 VaultCore: Zero-Knowledge Encrypted File Storage Service
+# 🔐 VaultCore: Password-Protected Encrypted File Storage Service
 
 <p align="center">
   <strong>Endüstri Standardı Kriptografik Güvenlik ile Dosya Kasası Backend'i</strong>
@@ -32,7 +32,9 @@
 
 ## 🏗 Genel Bakış
 
-VaultCore, **zero-knowledge** (sıfır bilgi) prensibiyle tasarlanmış bir dosya şifreleme ve depolama servisidir. Kullanıcı parolalarını hiçbir zaman saklamaz; dosyaları AES-256-GCM ile şifreler ve yalnızca şifreli versiyonlarını disk üzerinde tutar.
+VaultCore, parola korumalı bir dosya şifreleme ve depolama servisidir. Kullanıcı parolalarını hiçbir zaman saklamaz; dosyaları AES-256-GCM ile şifreler ve yalnızca şifreli versiyonlarını disk üzerinde tutar.
+
+> ℹ️ **Zero-knowledge değildir:** Şifreleme sunucu tarafında yapılır; sunucu istek süresince parolayı ve düz metni görür. Uçtan uca (E2E) gizlilik için şifrelemenin istemcide yapılması gerekir (yol haritasında).
 
 ### Temel Özellikler
 
@@ -41,7 +43,10 @@ VaultCore, **zero-knowledge** (sıfır bilgi) prensibiyle tasarlanmış bir dosy
 | 🔒 **AES-256-GCM** | Authenticated Encryption with Associated Data (AEAD) |
 | 🔑 **Argon2id KDF** | Bellek-yoğun anahtar türetme (GPU/ASIC dirençli) |
 | 🎲 **Benzersiz Salt/Nonce** | Her dosya için `os.urandom` ile CSPRNG tabanlı üretim |
-| 🚫 **Zero-Knowledge** | Parola asla saklanmaz, loglanmaz veya bellekte kalıcı tutulmaz |
+| 🚫 **Parola Saklanmaz** | Parola veritabanına yazılmaz ve loglanmaz |
+| 🔐 **API Key** | Yükleme, listeleme ve silme `X-API-Key` ile korunur |
+| 🧱 **Dosya Başına Kilitleme** | N hatalı denemeden sonra dosya geçici olarak kilitlenir (DB tabanlı) |
+| 🧹 **Otomatik Temizlik** | Süresi dolan / tükenen / silinen dosyaların şifreli verisi diskten silinir |
 | ⏱️ **Rate Limiting** | Brute-force saldırılarına karşı koruma |
 | 🔗 **Tek Kullanımlık Link** | `max_downloads=1` ile one-time download desteği |
 | ⏰ **Süre Sınırı** | `expires_in_hours` ile otomatik dosya süresi dolumu |
@@ -107,7 +112,7 @@ VaultCore, **zero-knowledge** (sıfır bilgi) prensibiyle tasarlanmış bir dosy
 
 | Saldırı Türü | Koruma Mekanizması |
 |--------------|-------------------|
-| **Brute-force parola** | Argon2id (memory-hard KDF) + Rate limiting |
+| **Brute-force parola** | Argon2id + IP rate limiting (Redis) + dosya başına kilitleme + min. 12 karakter parola |
 | **Rainbow table** | Her dosya için benzersiz 16-byte salt |
 | **Nonce reuse** | Her şifrelemede `os.urandom` ile benzersiz 12-byte nonce |
 | **Ciphertext tampering** | AES-GCM authentication tag doğrulaması |
@@ -115,14 +120,19 @@ VaultCore, **zero-knowledge** (sıfır bilgi) prensibiyle tasarlanmış bir dosy
 | **Information leakage** | Jenerik hata mesajları (yanlış parola vs. bozuk veri ayrımı yapılmaz) |
 | **Server-side parola sızıntısı** | Parola asla saklanmaz, loglanmaz, veritabanına yazılmaz |
 | **Disk üzerinde plaintext** | Dosyalar yalnızca şifreli formda (.enc) saklanır |
-| **Unlimited download** | One-time download ve expiration desteği |
+| **Unlimited download** | Atomik (race-free) indirme sayacı, expiration desteği |
+| **Ciphertext swap** | Dosya ID'si AES-GCM associated data (AAD) olarak bağlanır |
+| **KDF parametre değişimi** | Argon2 parametreleri dosya başına saklanır; ayar değişikliği eski dosyaları bozmaz |
+| **Header injection** | Dosya adı temizlenir, RFC 5987 `filename*` kullanılır, MIME tipi sabit |
+| **Bellek tüketimi (DoS)** | Parçalı upload okuma, KDF eşzamanlılık sınırı, event loop bloklanmaz |
 
 ### Kapsam Dışı (Out of Scope)
 
 | Konu | Açıklama |
 |------|----------|
 | Transport güvenliği | TLS/HTTPS reverse proxy (nginx) arkasında çalıştırılmalıdır |
-| Kullanıcı kimlik doğrulama | JWT/OAuth2 ile genişletilebilir (mevcut sürümde yok) |
+| Çok kullanıcılı yetkilendirme | Tek API key vardır; kullanıcı bazlı JWT/OAuth2 ile genişletilebilir |
+| Bellekten anahtar silme | Python'da güvenilir bellek temizliği mümkün değildir |
 | Anahtar yönetimi | HSM/KMS entegrasyonu üretim ortamında değerlendirilmelidir |
 | Dosya silme | Soft-delete uygulanmıştır; güvenli disk silme (secure wipe) eklenmeli |
 
@@ -198,7 +208,7 @@ AES Anahtarı:     256 bit (güçlü)
 
 ### `POST /api/v1/vault/upload`
 
-Dosyayı şifreler ve kasada saklar.
+Dosyayı şifreler ve kasada saklar. **`X-API-Key` gerekir.** Parola en az 12 karakter olmalıdır.
 
 **Request:** `multipart/form-data`
 
@@ -241,10 +251,15 @@ Dosyayı çözer ve indirir.
 | 401 | Unauthorized | Yanlış parola veya bozuk veri |
 | 404 | Not Found | Dosya bulunamadı |
 | 410 | Gone | Dosya süresi dolmuş veya indirme limiti aşılmış |
+| 429 | Too Many Requests | Rate limit aşıldı veya dosya kilitli |
 
 ### `GET /api/v1/vault/files`
 
-Kasadaki dosyaların metadata listesini döner.
+Kasadaki dosyaların metadata listesini döner. **`X-API-Key` gerekir.**
+
+### `DELETE /api/v1/vault/files/{file_id}`
+
+Kaydı pasifleştirir ve şifreli dosyayı diskten siler. **`X-API-Key` gerekir.** Yanıt: `204 No Content`
 
 **Response: `200 OK`**
 ```json
@@ -281,10 +296,10 @@ git clone https://github.com/hasancrlk/vaultcore.git
 cd vaultcore
 
 # .env dosyasını oluştur
-cp .env.example .env
+cp .env.example .env   # tüm change-me değerlerini değiştir
 
 # Docker ile başlat (PostgreSQL dahil)
-docker-compose up --build -d
+docker compose up --build -d
 
 # Servisin çalıştığını doğrula
 curl http://localhost:8000/health
@@ -298,7 +313,7 @@ python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # Bağımlılıkları yükle
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 # .env dosyasını oluştur ve PostgreSQL bağlantısını ayarla
 cp .env.example .env
@@ -312,6 +327,7 @@ python -m app.main
 ```bash
 # Dosya yükle
 curl -X POST http://localhost:8000/api/v1/vault/upload \
+  -H "X-API-Key: $API_KEY" \
   -F "file=@secret_document.pdf" \
   -F "password=my_strong_passphrase" \
   -F "max_downloads=3" \
@@ -324,7 +340,7 @@ curl -X POST http://localhost:8000/api/v1/vault/download/{file_id} \
   --output decrypted_document.pdf
 
 # Dosya listesi
-curl http://localhost:8000/api/v1/vault/files
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/api/v1/vault/files
 ```
 
 ---
@@ -391,7 +407,7 @@ vaultcore/
 │   └── test_vault.py            # Kapsamlı test süiti
 ├── encrypted_files/             # Şifreli dosya deposu (.enc)
 ├── Dockerfile                   # Multi-stage production build
-├── docker-compose.yml           # PostgreSQL + App orkestrasyon
+├── docker-compose.yml           # PostgreSQL + Redis + App
 ├── requirements.txt             # Python bağımlılıkları
 ├── pyproject.toml               # Pytest yapılandırması
 ├── .env.example                 # Ortam değişkenleri şablonu
@@ -405,11 +421,11 @@ vaultcore/
 
 ### Uygulanan Güvenlik Önlemleri
 
-1. **Zero-Knowledge Tasarım:** Sunucu, kullanıcı parolasını hiçbir zaman saklamaz. Parola yalnızca istek süresince bellekte tutulur ve işlem sonrası scope'tan çıkar.
+1. **Parola Saklanmaz:** Sunucu parolayı veritabanına yazmaz veya loglamaz; yalnızca istek süresince anahtar türetmek için kullanır.
 
 2. **Jenerik Hata Mesajları:** Yanlış parola ve bozuk veri arasında ayrım yapılmaz. Bu, **oracle attack** vektörünü ortadan kaldırır.
 
-3. **Rate Limiting:** İndirme endpoint'i dakikada 5 deneme ile sınırlıdır. Bu, online brute-force saldırılarını pratik olarak imkansız kılar.
+3. **Rate Limiting + Kilitleme:** İndirme IP başına dakikada 5 denemeyle sınırlıdır (çoklu worker için Redis). Ayrıca aynı dosyaya 5 hatalı denemede dosya 15 dakika kilitlenir; dağıtık saldırılara karşı da çalışır.
 
 4. **Güvenlik Başlıkları:** Tüm yanıtlarda `X-Content-Type-Options`, `X-Frame-Options`, `HSTS`, `CSP`, `Referrer-Policy` başlıkları ayarlanır.
 
@@ -420,11 +436,10 @@ vaultcore/
 ### Üretim Ortamı İçin Tavsiyeler
 
 - [ ] TLS/HTTPS için reverse proxy (nginx/Caddy) kullanın
-- [ ] `DATABASE_URL` içindeki parolayı güçlü bir değerle değiştirin
+- [ ] `.env` içindeki tüm `change-me` değerlerini güçlü rastgele değerlerle değiştirin
 - [ ] `ARGON2_MEMORY_COST` değerini sunucu kapasitesine göre artırın
 - [ ] Dosya boyut limitini (`MAX_FILE_SIZE_MB`) ihtiyaca göre ayarlayın
 - [ ] Log seviyesini `WARNING` olarak ayarlayın
-- [ ] Süresi dolmuş dosyalar için periyodik temizlik cron job'u ekleyin
 - [ ] WAF (Web Application Firewall) kullanın
 - [ ] Güvenlik denetimi (pentest) yaptırın
 

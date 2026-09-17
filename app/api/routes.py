@@ -1,67 +1,61 @@
 """
 VaultCore API Routes.
 
-RESTful endpoints for the encrypted file vault.
-
-Security Design:
-    - All error responses use generic messages to prevent information leakage.
-    - Rate limiting protects against brute-force password attacks.
-    - Passwords are received via form data / JSON body (NOT URL parameters).
-    - No sensitive data (passwords, keys, salts, nonces) appears in response bodies.
-    - Timing-safe operations prevent side-channel attacks.
+    - Upload / list / delete require the X-API-Key header.
+    - Download requires only file ID + password (shareable link model),
+      protected by IP rate limiting and a per-file lockout.
+    - Error messages never distinguish wrong password from tampered data.
 """
 
 import logging
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.dependencies import limiter
+from app.api.dependencies import limiter, require_api_key
 from app.config import settings
 from app.database import get_db
 from app.services.vault_service import (
     DecryptionError,
     FileExpiredError,
-    FileNotFoundError,
+    FileLockedError,
     FileSizeExceededError,
+    VaultFileNotFoundError,
     VaultService,
+    WeakPasswordError,
+    ascii_filename,
+    to_public_metadata,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/vault", tags=["vault"])
 
+READ_CHUNK = 1024 * 1024
 
-# ─── Pydantic Schemas ────────────────────────────────────────────────────────
+
+# ─── Schemas ─────────────────────────────────────────────────────────────────
 
 
 class UploadResponse(BaseModel):
-    """Response schema for successful file upload."""
-    id: str = Field(..., description="Unique file identifier (UUID)")
-    filename: str = Field(..., description="Original filename")
-    encrypted_size: int = Field(..., description="Size of encrypted file in bytes")
-    upload_date: str = Field(..., description="ISO 8601 upload timestamp")
-    message: str = Field(default="File encrypted and stored successfully")
-    max_downloads: Optional[int] = Field(None, description="Maximum allowed downloads")
-    expires_at: Optional[str] = Field(None, description="Expiration timestamp (ISO 8601)")
+    id: str
+    filename: str
+    encrypted_size: int
+    upload_date: str
+    message: str = "File encrypted and stored successfully"
+    max_downloads: int | None = None
+    expires_at: str | None = None
 
 
 class DownloadRequest(BaseModel):
-    """Request schema for file download."""
-    password: str = Field(
-        ...,
-        min_length=1,
-        description="Passphrase used during encryption",
-    )
+    password: str = Field(..., min_length=1, max_length=1024)
 
 
 class FileMetadata(BaseModel):
-    """Public metadata for a stored file (no sensitive fields)."""
     id: str
     filename: str
     encrypted_size: int
@@ -69,116 +63,97 @@ class FileMetadata(BaseModel):
     content_type: str
     upload_date: str
     download_count: int
-    max_downloads: Optional[int]
-    expires_at: Optional[str]
+    max_downloads: int | None
+    expires_at: str | None
     is_available: bool
 
 
 class FileListResponse(BaseModel):
-    """Response schema for file listing."""
     files: list[FileMetadata]
     total: int
 
 
 class ErrorResponse(BaseModel):
-    """Generic error response (no sensitive details)."""
     detail: str
 
 
-# ─── Endpoints ────────────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+
+async def _read_limited(file: UploadFile, limit: int) -> bytes:
+    """Read the upload in chunks and stop as soon as the limit is exceeded."""
+    chunks, size = [], 0
+    while chunk := await file.read(READ_CHUNK):
+        size += len(chunk)
+        if size > limit:
+            raise FileSizeExceededError()
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────
 
 
 @router.post(
     "/upload",
     response_model=UploadResponse,
     status_code=201,
-    responses={
-        400: {"model": ErrorResponse, "description": "Invalid request"},
-        413: {"model": ErrorResponse, "description": "File too large"},
-    },
+    dependencies=[Depends(require_api_key)],
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 413: {"model": ErrorResponse}},
     summary="Upload and encrypt a file",
-    description=(
-        "Accepts a file and a passphrase via multipart form-data. "
-        "The file is encrypted with AES-256-GCM using an Argon2id-derived key. "
-        "The passphrase is NEVER stored — only used transiently for key derivation."
-    ),
 )
 @limiter.limit(settings.RATE_LIMIT_UPLOAD)
 async def upload_file(
     request: Request,
-    file: UploadFile = File(..., description="File to encrypt and store"),
-    password: str = Form(..., min_length=1, description="Encryption passphrase"),
-    max_downloads: Optional[int] = Form(
-        None, description="Maximum number of downloads (null = unlimited)", ge=1
-    ),
-    expires_in_hours: Optional[int] = Form(
-        None, description="Hours until file expires (null = no expiry)", ge=1
-    ),
+    file: UploadFile = File(...),
+    password: str = Form(..., min_length=1, max_length=1024),
+    max_downloads: int | None = Form(None, ge=1),
+    expires_in_hours: int | None = Form(None, ge=1, le=24 * 365),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload, encrypt, and store a file in the vault."""
     try:
-        # Read file content
-        file_content = await file.read()
+        content = await _read_limited(file, settings.max_file_size_bytes)
+        if not content:
+            raise HTTPException(400, "Empty file")
 
-        if not file_content:
-            raise HTTPException(status_code=400, detail="Empty file")
-
-        # Calculate expiration time if specified
-        expires_at = None
-        if expires_in_hours:
-            from datetime import timedelta
-            expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
-
-        # Process upload
-        service = VaultService(db)
-        file_record = await service.upload_file(
-            file_content=file_content,
-            filename=file.filename or "unnamed",
+        expires_at = (
+            datetime.now(UTC) + timedelta(hours=expires_in_hours)
+            if expires_in_hours else None
+        )
+        record = await VaultService(db).upload_file(
+            file_content=content,
+            filename=file.filename,
             password=password,
-            content_type=file.content_type or "application/octet-stream",
+            content_type=file.content_type,
             max_downloads=max_downloads,
             expires_at=expires_at,
         )
+    except FileSizeExceededError:
+        raise HTTPException(413, f"File exceeds {settings.MAX_FILE_SIZE_MB} MB")
+    except WeakPasswordError as e:
+        raise HTTPException(400, str(e))
 
-        return UploadResponse(
-            id=str(file_record.id),
-            filename=file_record.original_filename,
-            encrypted_size=file_record.encrypted_size,
-            upload_date=file_record.upload_date.isoformat(),
-            max_downloads=file_record.max_downloads,
-            expires_at=file_record.expires_at.isoformat() if file_record.expires_at else None,
-        )
-
-    except HTTPException:
-        raise
-    except FileSizeExceededError as e:
-        raise HTTPException(status_code=413, detail=str(e))
-    except Exception as e:
-        logger.exception("Upload failed unexpectedly")
-        raise HTTPException(status_code=500, detail="Internal server error")
-    finally:
-        # Best-effort password cleanup from local scope
-        password = ""  # noqa: F841
+    meta = to_public_metadata(record)
+    return UploadResponse(
+        id=meta["id"],
+        filename=meta["filename"],
+        encrypted_size=meta["encrypted_size"],
+        upload_date=meta["upload_date"],
+        max_downloads=meta["max_downloads"],
+        expires_at=meta["expires_at"],
+    )
 
 
 @router.post(
     "/download/{file_id}",
     responses={
-        200: {
-            "description": "Decrypted file content",
-            "content": {"application/octet-stream": {}},
-        },
-        401: {"model": ErrorResponse, "description": "Invalid credentials or corrupted data"},
-        404: {"model": ErrorResponse, "description": "File not found"},
-        410: {"model": ErrorResponse, "description": "File expired or download limit reached"},
+        200: {"content": {"application/octet-stream": {}}},
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        410: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
     },
     summary="Download and decrypt a file",
-    description=(
-        "Accepts a file ID and passphrase. Re-derives the encryption key using "
-        "Argon2id with the stored salt, then decrypts the file with AES-256-GCM. "
-        "Returns the decrypted file as a streaming response."
-    ),
 )
 @limiter.limit(settings.RATE_LIMIT_DOWNLOAD)
 async def download_file(
@@ -187,68 +162,50 @@ async def download_file(
     body: DownloadRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Decrypt and download a file from the vault."""
     try:
-        service = VaultService(db)
-        plaintext, filename, content_type = await service.download_file(
-            file_id=file_id,
-            password=body.password,
-        )
-
-        # Stream the decrypted content
-        return Response(
-            content=plaintext,
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(plaintext)),
-                "X-Content-Type-Options": "nosniff",
-                "Cache-Control": "no-store, no-cache, must-revalidate",
-                "Pragma": "no-cache",
-            },
-        )
-
-    except FileNotFoundError:
-        # Generic 404 — do not reveal whether the ID exists
-        raise HTTPException(status_code=404, detail="File not found")
+        plaintext, filename = await VaultService(db).download_file(file_id, body.password)
+    except VaultFileNotFoundError:
+        raise HTTPException(404, "File not found")
     except FileExpiredError:
-        raise HTTPException(
-            status_code=410,
-            detail="File is no longer available (expired or download limit reached)",
-        )
+        raise HTTPException(410, "File is no longer available")
+    except FileLockedError:
+        raise HTTPException(429, "Too many failed attempts; try again later")
     except DecryptionError:
-        # CRITICAL: Generic 401 — do NOT differentiate between wrong password
-        # and tampered ciphertext. This prevents oracle attacks.
-        raise HTTPException(
-            status_code=401,
-            detail="Decryption failed: invalid credentials or corrupted data",
-        )
-    except Exception as e:
-        logger.exception("Download failed unexpectedly")
-        raise HTTPException(status_code=500, detail="Internal server error")
-    finally:
-        body.password = ""  # noqa: F841
+        raise HTTPException(401, "Decryption failed: invalid credentials or corrupted data")
+
+    disposition = (
+        f'attachment; filename="{ascii_filename(filename)}"; '
+        f"filename*=UTF-8''{quote(filename, safe='')}"
+    )
+    return Response(
+        content=plaintext,
+        media_type="application/octet-stream",  # never echo user-supplied MIME types
+        headers={
+            "Content-Disposition": disposition,
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 @router.get(
     "/files",
     response_model=FileListResponse,
-    summary="List encrypted files metadata",
-    description=(
-        "Returns metadata for all active encrypted files. "
-        "NEVER returns file content, passwords, cryptographic material, "
-        "or any other sensitive information."
-    ),
+    dependencies=[Depends(require_api_key)],
+    summary="List metadata of active files",
 )
-async def list_files(
-    request: Request,
-    db: AsyncSession = Depends(get_db),
-):
-    """List metadata of all active encrypted files in the vault."""
-    service = VaultService(db)
-    files = await service.list_files()
+async def list_files(db: AsyncSession = Depends(get_db)):
+    files = [to_public_metadata(f) for f in await VaultService(db).list_files()]
+    return FileListResponse(files=[FileMetadata(**f) for f in files], total=len(files))
 
-    return FileListResponse(
-        files=[FileMetadata(**f) for f in files],
-        total=len(files),
-    )
+
+@router.delete(
+    "/files/{file_id}",
+    status_code=204,
+    dependencies=[Depends(require_api_key)],
+    summary="Delete a file (removes ciphertext)",
+)
+async def delete_file(file_id: UUID, db: AsyncSession = Depends(get_db)):
+    if not await VaultService(db).delete_file(file_id):
+        raise HTTPException(404, "File not found")
+    return Response(status_code=204)

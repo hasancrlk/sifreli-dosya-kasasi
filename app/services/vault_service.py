@@ -1,65 +1,85 @@
 """
 VaultCore Vault Service.
 
-Business logic layer for encrypted file operations.
-Orchestrates cryptographic operations, file I/O, and database persistence.
+Business logic for encrypted file operations.
 
-Security Invariants:
-    - Passwords exist in memory only during the encrypt/decrypt call.
-    - All file I/O uses the encrypted form; plaintext is never written to disk.
-    - Cryptographic failures produce generic error messages (no info leakage).
+Invariants:
+    - Passwords are never stored or logged.
+    - Plaintext is never written to disk.
+    - CPU/memory-heavy KDF work runs in a thread pool behind a semaphore,
+      so it neither blocks the event loop nor exhausts memory.
+    - Download limits are enforced with an atomic UPDATE (race-free).
 """
 
-import uuid
+import asyncio
 import logging
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+import os
+import re
+import unicodedata
+import uuid
+from datetime import datetime, timedelta
 
 import aiofiles
+from anyio import to_thread
 from cryptography.exceptions import InvalidTag
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.crypto.engine import encrypt, decrypt
-from app.models.vault import EncryptedFile
+from app.crypto.engine import CryptoParams, decrypt, encrypt
+from app.models.vault import EncryptedFile, as_utc, utcnow
 
 logger = logging.getLogger(__name__)
+
+_kdf_semaphore = asyncio.Semaphore(settings.KDF_MAX_CONCURRENCY)
 
 
 class VaultServiceError(Exception):
     """Base exception for vault service errors."""
-    pass
 
 
-class FileNotFoundError(VaultServiceError):
-    """Raised when a requested file does not exist."""
-    pass
+class VaultFileNotFoundError(VaultServiceError):
+    """Requested file does not exist."""
 
 
 class FileExpiredError(VaultServiceError):
-    """Raised when a file has expired or reached download limits."""
-    pass
+    """File expired, deactivated or download limit reached."""
+
+
+class FileLockedError(VaultServiceError):
+    """Too many failed attempts; file temporarily locked."""
 
 
 class DecryptionError(VaultServiceError):
-    """Raised when decryption fails (wrong password or tampered data)."""
-    pass
+    """Wrong password or tampered data."""
 
 
 class FileSizeExceededError(VaultServiceError):
-    """Raised when uploaded file exceeds the size limit."""
-    pass
+    """Uploaded file exceeds the size limit."""
+
+
+class WeakPasswordError(VaultServiceError):
+    """Password does not meet the policy."""
+
+
+async def _run_kdf_bound(func, *args):
+    async with _kdf_semaphore:
+        return await to_thread.run_sync(func, *args)
+
+
+def sanitize_filename(name: str | None) -> str:
+    """Strip paths and control characters; keep a display-safe name."""
+    name = os.path.basename((name or "").replace("\\", "/"))
+    name = "".join(c for c in name if unicodedata.category(c)[0] != "C").strip()
+    return name[:255] or "unnamed"
+
+
+def ascii_filename(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "download"
 
 
 class VaultService:
-    """
-    Service class for vault operations.
-
-    Handles the complete lifecycle of encrypted files:
-    upload (encrypt + store) and download (retrieve + decrypt).
-    """
+    """Upload (encrypt + store), download (decrypt), list, delete and purge."""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -68,231 +88,211 @@ class VaultService:
     async def upload_file(
         self,
         file_content: bytes,
-        filename: str,
+        filename: str | None,
         password: str,
-        content_type: str = "application/octet-stream",
-        max_downloads: Optional[int] = None,
-        expires_at: Optional[datetime] = None,
+        content_type: str | None = None,
+        max_downloads: int | None = None,
+        expires_at: datetime | None = None,
     ) -> EncryptedFile:
-        """
-        Encrypt and store a file in the vault.
-
-        Process:
-            1. Validate file size.
-            2. Encrypt file content with AES-256-GCM (Argon2id-derived key).
-            3. Write encrypted data to disk as .enc file.
-            4. Store metadata (NOT the password) in PostgreSQL.
-
-        Args:
-            file_content: Raw file bytes to encrypt.
-            filename: Original filename for metadata.
-            password: Passphrase for encryption (NOT stored).
-            content_type: MIME type of the original file.
-            max_downloads: Optional limit on download count (None = unlimited).
-            expires_at: Optional expiration datetime (None = no expiry).
-
-        Returns:
-            EncryptedFile metadata record.
-
-        Raises:
-            FileSizeExceededError: If file exceeds MAX_FILE_SIZE_MB.
-        """
-        # Validate file size
         if len(file_content) > settings.max_file_size_bytes:
             raise FileSizeExceededError(
-                f"File size ({len(file_content)} bytes) exceeds "
-                f"maximum allowed ({settings.max_file_size_bytes} bytes)"
+                f"File exceeds maximum allowed size ({settings.MAX_FILE_SIZE_MB} MB)"
+            )
+        if len(password) < settings.MIN_PASSWORD_LENGTH:
+            raise WeakPasswordError(
+                f"Password must be at least {settings.MIN_PASSWORD_LENGTH} characters"
             )
 
-        # Encrypt the file content
-        # Password is only used here and not stored anywhere
-        encryption_result = encrypt(file_content, password)
-
-        # Generate unique filename for encrypted file
         file_id = uuid.uuid4()
+        result = await _run_kdf_bound(encrypt, file_content, password, file_id.bytes)
+
         encrypted_filename = f"{file_id}.enc"
-        encrypted_filepath = self.storage_path / encrypted_filename
+        final_path = self.storage_path / encrypted_filename
+        tmp_path = final_path.with_suffix(".tmp")
 
-        # Write encrypted data to disk
-        async with aiofiles.open(encrypted_filepath, "wb") as f:
-            await f.write(encryption_result.ciphertext)
+        async with aiofiles.open(tmp_path, "wb") as f:
+            await f.write(result.ciphertext)
+        os.replace(tmp_path, final_path)  # atomic: no half-written .enc files
 
-        # Create metadata record (NO password stored)
-        file_record = EncryptedFile(
+        record = EncryptedFile(
             id=file_id,
-            original_filename=filename,
+            original_filename=sanitize_filename(filename),
             encrypted_filename=encrypted_filename,
             original_size=len(file_content),
-            encrypted_size=len(encryption_result.ciphertext),
-            content_type=content_type,
-            salt_hex=encryption_result.salt.hex(),
-            nonce_hex=encryption_result.nonce.hex(),
+            encrypted_size=len(result.ciphertext),
+            content_type=(content_type or "application/octet-stream")[:255],
+            salt_hex=result.salt.hex(),
+            nonce_hex=result.nonce.hex(),
+            kdf_time_cost=result.params.time_cost,
+            kdf_memory_cost=result.params.memory_cost,
+            kdf_parallelism=result.params.parallelism,
             max_downloads=max_downloads,
             expires_at=expires_at,
         )
+        try:
+            self.db.add(record)
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            final_path.unlink(missing_ok=True)  # never leave orphan ciphertext
+            raise
 
-        self.db.add(file_record)
-        await self.db.flush()
+        logger.info("File uploaded: id=%s size=%d", file_id, len(result.ciphertext))
+        return record
 
-        logger.info(
-            "File uploaded: id=%s, original_name='%s', encrypted_size=%d bytes",
-            file_id,
-            filename,
-            len(encryption_result.ciphertext),
-        )
+    async def download_file(self, file_id: uuid.UUID, password: str) -> tuple[bytes, str]:
+        record = await self.db.get(EncryptedFile, file_id)
+        if record is None:
+            raise VaultFileNotFoundError(file_id)
+        if not record.is_available:
+            raise FileExpiredError(file_id)
+        if record.is_locked:
+            raise FileLockedError(file_id)
 
-        # Password variable goes out of scope here — Python GC will reclaim it.
-        # We do NOT store it in any instance variable, log, or database field.
-        return file_record
+        path = self.storage_path / record.encrypted_filename
+        if not path.exists():
+            logger.error("Encrypted file missing from disk: %s", record.encrypted_filename)
+            raise VaultFileNotFoundError(file_id)
 
-    async def download_file(
-        self, file_id: uuid.UUID, password: str
-    ) -> tuple[bytes, str, str]:
-        """
-        Retrieve and decrypt a file from the vault.
-
-        Process:
-            1. Fetch metadata from database.
-            2. Verify file is available (active, not expired, within download limits).
-            3. Read encrypted data from disk.
-            4. Re-derive key from password + stored salt using Argon2id.
-            5. Decrypt with AES-256-GCM using stored nonce.
-            6. Increment download counter.
-
-        Args:
-            file_id: UUID of the file to download.
-            password: Passphrase for decryption (NOT stored).
-
-        Returns:
-            Tuple of (decrypted_content, original_filename, content_type).
-
-        Raises:
-            FileNotFoundError: If file_id doesn't exist in database.
-            FileExpiredError: If file is expired, deactivated, or download limit reached.
-            DecryptionError: If password is wrong or ciphertext is tampered.
-        """
-        # Fetch file metadata
-        result = await self.db.execute(
-            select(EncryptedFile).where(EncryptedFile.id == file_id)
-        )
-        file_record = result.scalar_one_or_none()
-
-        if file_record is None:
-            raise FileNotFoundError(f"File not found: {file_id}")
-
-        # Check availability (expiration, download limits, active status)
-        if not file_record.is_available:
-            if file_record.is_expired:
-                raise FileExpiredError("File has expired and is no longer available")
-            if file_record.is_download_limit_reached:
-                raise FileExpiredError("File has reached its maximum download limit")
-            raise FileExpiredError("File is no longer available")
-
-        # Read encrypted data from disk
-        encrypted_filepath = self.storage_path / file_record.encrypted_filename
-        if not encrypted_filepath.exists():
-            logger.error(
-                "Encrypted file missing from disk: %s", file_record.encrypted_filename
-            )
-            raise FileNotFoundError("Encrypted file not found on storage")
-
-        async with aiofiles.open(encrypted_filepath, "rb") as f:
+        async with aiofiles.open(path, "rb") as f:
             ciphertext = await f.read()
 
-        # Reconstruct cryptographic parameters from stored hex values
-        salt = bytes.fromhex(file_record.salt_hex)
-        nonce = bytes.fromhex(file_record.nonce_hex)
-
-        # Attempt decryption
+        params = CryptoParams(record.kdf_time_cost, record.kdf_memory_cost, record.kdf_parallelism)
         try:
-            plaintext = decrypt(ciphertext, password, salt, nonce)
+            plaintext = await _run_kdf_bound(
+                decrypt, ciphertext, password,
+                bytes.fromhex(record.salt_hex), bytes.fromhex(record.nonce_hex),
+                params, file_id.bytes,
+            )
         except InvalidTag:
-            # Generic error message — do NOT reveal whether password was wrong
-            # or data was tampered with (prevents oracle attacks)
-            raise DecryptionError(
-                "Decryption failed: invalid credentials or corrupted data"
+            await self._register_failed_attempt(file_id)
+            raise DecryptionError(file_id)
+
+        # Atomically claim one download; concurrent requests cannot exceed the limit.
+        claimed = await self.db.execute(
+            update(EncryptedFile)
+            .where(
+                EncryptedFile.id == file_id,
+                EncryptedFile.is_active.is_(True),
+                or_(
+                    EncryptedFile.max_downloads.is_(None),
+                    EncryptedFile.download_count < EncryptedFile.max_downloads,
+                ),
             )
-
-        # Increment download counter
-        file_record.download_count += 1
-
-        # If max_downloads is reached after this download, deactivate the file
-        if file_record.is_download_limit_reached:
-            file_record.is_active = False
-            logger.info(
-                "File %s deactivated: download limit (%d) reached",
-                file_id,
-                file_record.max_downloads,
-            )
-
-        await self.db.flush()
-
-        logger.info(
-            "File downloaded: id=%s, download_count=%d",
-            file_id,
-            file_record.download_count,
+            .values(download_count=EncryptedFile.download_count + 1, failed_attempts=0)
+            .execution_options(synchronize_session=False)
         )
+        if claimed.rowcount != 1:
+            await self.db.rollback()
+            raise FileExpiredError(file_id)
 
-        return plaintext, file_record.original_filename, file_record.content_type
+        # Deactivate once the limit is hit and shred the ciphertext.
+        exhausted = await self.db.execute(
+            update(EncryptedFile)
+            .where(
+                EncryptedFile.id == file_id,
+                EncryptedFile.max_downloads.is_not(None),
+                EncryptedFile.download_count >= EncryptedFile.max_downloads,
+            )
+            .values(is_active=False)
+            .execution_options(synchronize_session=False)
+        )
+        await self.db.commit()
+        if exhausted.rowcount:
+            path.unlink(missing_ok=True)
+            logger.info("File %s exhausted and removed from storage", file_id)
 
-    async def list_files(self) -> list[dict]:
-        """
-        List metadata of all active encrypted files.
+        return plaintext, record.original_filename
 
-        Security Note:
-            - Returns ONLY non-sensitive metadata.
-            - Does NOT return: salt, nonce, file content, or any cryptographic material.
-            - Expired/deactivated files are excluded from results.
+    async def _register_failed_attempt(self, file_id: uuid.UUID) -> None:
+        await self.db.execute(
+            update(EncryptedFile)
+            .where(EncryptedFile.id == file_id)
+            .values(failed_attempts=EncryptedFile.failed_attempts + 1)
+            .execution_options(synchronize_session=False)
+        )
+        await self.db.execute(
+            update(EncryptedFile)
+            .where(
+                EncryptedFile.id == file_id,
+                EncryptedFile.failed_attempts >= settings.MAX_FAILED_ATTEMPTS,
+            )
+            .values(
+                failed_attempts=0,
+                locked_until=utcnow() + timedelta(minutes=settings.LOCKOUT_MINUTES),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await self.db.commit()
 
-        Returns:
-            List of dictionaries containing file metadata.
-        """
+    async def list_files(self) -> list[EncryptedFile]:
         result = await self.db.execute(
             select(EncryptedFile)
-            .where(EncryptedFile.is_active == True)  # noqa: E712
+            .where(EncryptedFile.is_active.is_(True))
             .order_by(EncryptedFile.upload_date.desc())
         )
-        files = result.scalars().all()
-
-        return [
-            {
-                "id": str(f.id),
-                "filename": f.original_filename,
-                "encrypted_size": f.encrypted_size,
-                "original_size": f.original_size,
-                "content_type": f.content_type,
-                "upload_date": f.upload_date.isoformat(),
-                "download_count": f.download_count,
-                "max_downloads": f.max_downloads,
-                "expires_at": f.expires_at.isoformat() if f.expires_at else None,
-                "is_available": f.is_available,
-            }
-            for f in files
-        ]
+        return list(result.scalars().all())
 
     async def delete_file(self, file_id: uuid.UUID) -> bool:
-        """
-        Soft-delete a file by deactivating it.
-
-        The encrypted file remains on disk but is no longer available for download.
-        A separate cleanup job can purge deactivated files.
-
-        Args:
-            file_id: UUID of the file to deactivate.
-
-        Returns:
-            True if file was found and deactivated, False if not found.
-        """
-        result = await self.db.execute(
-            select(EncryptedFile).where(EncryptedFile.id == file_id)
-        )
-        file_record = result.scalar_one_or_none()
-
-        if file_record is None:
+        """Deactivate the record and delete the ciphertext (crypto-shredding)."""
+        record = await self.db.get(EncryptedFile, file_id)
+        if record is None:
             return False
-
-        file_record.is_active = False
-        await self.db.flush()
-
-        logger.info("File deactivated: id=%s", file_id)
+        record.is_active = False
+        await self.db.commit()
+        (self.storage_path / record.encrypted_filename).unlink(missing_ok=True)
+        logger.info("File deleted: id=%s", file_id)
         return True
+
+    async def purge_unavailable(self) -> int:
+        """Remove ciphertext of expired/inactive/exhausted files and stray temp files."""
+        now = utcnow()
+        result = await self.db.execute(
+            select(EncryptedFile).where(
+                or_(
+                    EncryptedFile.is_active.is_(False),
+                    EncryptedFile.expires_at <= now,
+                    and_(
+                        EncryptedFile.max_downloads.is_not(None),
+                        EncryptedFile.download_count >= EncryptedFile.max_downloads,
+                    ),
+                )
+            )
+        )
+        purged = 0
+        for record in result.scalars():
+            record.is_active = False
+            path = self.storage_path / record.encrypted_filename
+            if path.exists():
+                path.unlink()
+                purged += 1
+        await self.db.commit()
+
+        known = set((await self.db.execute(select(EncryptedFile.encrypted_filename))).scalars())
+        cutoff = now.timestamp() - 3600
+        for path in self.storage_path.iterdir():
+            orphan = path.suffix == ".tmp" or (path.suffix == ".enc" and path.name not in known)
+            if orphan and path.stat().st_mtime < cutoff:
+                path.unlink(missing_ok=True)
+                purged += 1
+
+        if purged:
+            logger.info("Purged %d stale encrypted files", purged)
+        return purged
+
+
+def to_public_metadata(f: EncryptedFile) -> dict:
+    """Non-sensitive metadata only (no salt, nonce, KDF params)."""
+    expires = as_utc(f.expires_at)
+    return {
+        "id": str(f.id),
+        "filename": f.original_filename,
+        "encrypted_size": f.encrypted_size,
+        "original_size": f.original_size,
+        "content_type": f.content_type,
+        "upload_date": as_utc(f.upload_date).isoformat(),
+        "download_count": f.download_count,
+        "max_downloads": f.max_downloads,
+        "expires_at": expires.isoformat() if expires else None,
+        "is_available": f.is_available,
+    }
