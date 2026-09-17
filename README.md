@@ -277,7 +277,7 @@ Kasadaki dosyaların metadata listesini döner.
 
 ```bash
 # Projeyi klonla
-git clone https://github.com/YOUR_USERNAME/vaultcore.git
+git clone https://github.com/hasancrlk/vaultcore.git
 cd vaultcore
 
 # .env dosyasını oluştur
