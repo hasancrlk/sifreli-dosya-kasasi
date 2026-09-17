@@ -1,0 +1,64 @@
+version: "3.9"
+
+services:
+  # ─── PostgreSQL Database ──────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: vaultcore-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vaultcore
+      POSTGRES_PASSWORD: vaultcore_secret
+      POSTGRES_DB: vaultcore_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaultcore -d vaultcore_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - vaultcore-network
+
+  # ─── VaultCore Application ────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vaultcore-app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://vaultcore:vaultcore_secret@db:5432/vaultcore_db
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      APP_ENV: production
+      DEBUG: "false"
+      ENCRYPTED_FILES_DIR: /app/encrypted_files
+      ARGON2_TIME_COST: "3"
+      ARGON2_MEMORY_COST: "65536"
+      ARGON2_PARALLELISM: "4"
+      MAX_FILE_SIZE_MB: "100"
+      RATE_LIMIT_DOWNLOAD: "5/minute"
+      RATE_LIMIT_UPLOAD: "10/minute"
+    ports:
+      - "8000:8000"
+    volumes:
+      - encrypted_files:/app/encrypted_files
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - vaultcore-network
+
+volumes:
+  postgres_data:
+    driver: local
+  encrypted_files:
+    driver: local
+
+networks:
+  vaultcore-network:
+    driver: bridge

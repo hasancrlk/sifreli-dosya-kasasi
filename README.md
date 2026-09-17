@@ -1,0 +1,441 @@
+# 🔐 VaultCore: Zero-Knowledge Encrypted File Storage Service
+
+<p align="center">
+  <strong>Endüstri Standardı Kriptografik Güvenlik ile Dosya Kasası Backend'i</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12-blue?logo=python" alt="Python">
+  <img src="https://img.shields.io/badge/FastAPI-0.115-green?logo=fastapi" alt="FastAPI">
+  <img src="https://img.shields.io/badge/Encryption-AES--256--GCM-red?logo=letsencrypt" alt="AES-256-GCM">
+  <img src="https://img.shields.io/badge/KDF-Argon2id-orange" alt="Argon2id">
+  <img src="https://img.shields.io/badge/Database-PostgreSQL-blue?logo=postgresql" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
+</p>
+
+---
+
+## 📋 İçindekiler
+
+- [Genel Bakış](#-genel-bakış)
+- [Kriptografik Mimari](#-kriptografik-mimari)
+- [Tehdit Modeli (Threat Model)](#-tehdit-modeli-threat-model)
+- [Neden AES-GCM?](#-neden-aes-gcm)
+- [Neden KDF (Key Derivation Function)?](#-neden-kdf-key-derivation-function)
+- [API Referansı](#-api-referansı)
+- [Kurulum](#-kurulum)
+- [Testler](#-testler)
+- [Proje Yapısı](#-proje-yapısı)
+- [Güvenlik Politikaları](#-güvenlik-politikaları)
+
+---
+
+## 🏗 Genel Bakış
+
+VaultCore, **zero-knowledge** (sıfır bilgi) prensibiyle tasarlanmış bir dosya şifreleme ve depolama servisidir. Kullanıcı parolalarını hiçbir zaman saklamaz; dosyaları AES-256-GCM ile şifreler ve yalnızca şifreli versiyonlarını disk üzerinde tutar.
+
+### Temel Özellikler
+
+| Özellik | Açıklama |
+|---------|----------|
+| 🔒 **AES-256-GCM** | Authenticated Encryption with Associated Data (AEAD) |
+| 🔑 **Argon2id KDF** | Bellek-yoğun anahtar türetme (GPU/ASIC dirençli) |
+| 🎲 **Benzersiz Salt/Nonce** | Her dosya için `os.urandom` ile CSPRNG tabanlı üretim |
+| 🚫 **Zero-Knowledge** | Parola asla saklanmaz, loglanmaz veya bellekte kalıcı tutulmaz |
+| ⏱️ **Rate Limiting** | Brute-force saldırılarına karşı koruma |
+| 🔗 **Tek Kullanımlık Link** | `max_downloads=1` ile one-time download desteği |
+| ⏰ **Süre Sınırı** | `expires_in_hours` ile otomatik dosya süresi dolumu |
+| 🐳 **Docker Ready** | PostgreSQL ile tek komutla çalışan konteyner ortamı |
+
+---
+
+## 🔐 Kriptografik Mimari
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     UPLOAD (Şifreleme) Akışı                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Kullanıcı Parolası ──┐                                         │
+│                       ▼                                         │
+│              ┌─────────────────┐                                │
+│              │   Argon2id KDF  │◄── Salt (16 byte, os.urandom)  │
+│              │                 │                                │
+│              │  time_cost=3    │                                │
+│              │  memory=64 MB   │                                │
+│              │  parallelism=4  │                                │
+│              └────────┬────────┘                                │
+│                       │                                         │
+│                       ▼                                         │
+│              256-bit Encryption Key                             │
+│                       │                                         │
+│                       ▼                                         │
+│              ┌─────────────────┐                                │
+│              │  AES-256-GCM    │◄── Nonce (12 byte, os.urandom) │
+│              │  Encrypt + MAC  │                                │
+│              └────────┬────────┘                                │
+│                       │                                         │
+│                       ▼                                         │
+│         Ciphertext + 16-byte Auth Tag                           │
+│                       │                                         │
+│           ┌───────────┴──────────┐                              │
+│           ▼                      ▼                              │
+│     .enc dosyası           PostgreSQL                           │
+│     (disk üzerinde)        (salt, nonce,                        │
+│                            metadata)                            │
+│                                                                 │
+│     ⚠️  Parola ASLA saklanmaz!                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Şifreleme Detayları
+
+| Parametre | Değer | Açıklama |
+|-----------|-------|----------|
+| Algoritma | AES-256-GCM | NIST onaylı AEAD şifreleme |
+| Anahtar Boyutu | 256 bit (32 byte) | Brute-force'a karşı 2^256 güvenlik seviyesi |
+| Nonce Boyutu | 96 bit (12 byte) | NIST SP 800-38D tavsiyesi |
+| Salt Boyutu | 128 bit (16 byte) | KDF için benzersiz girdi |
+| Auth Tag | 128 bit (16 byte) | Bütünlük doğrulama etiketi |
+| KDF | Argon2id | RFC 9106, PHC (Password Hashing Competition) kazananı |
+
+---
+
+## 🛡 Tehdit Modeli (Threat Model)
+
+### Koruma Sağlanan Saldırılar
+
+| Saldırı Türü | Koruma Mekanizması |
+|--------------|-------------------|
+| **Brute-force parola** | Argon2id (memory-hard KDF) + Rate limiting |
+| **Rainbow table** | Her dosya için benzersiz 16-byte salt |
+| **Nonce reuse** | Her şifrelemede `os.urandom` ile benzersiz 12-byte nonce |
+| **Ciphertext tampering** | AES-GCM authentication tag doğrulaması |
+| **Timing attack** | `hmac.compare_digest` ile sabit-zamanlı karşılaştırma |
+| **Information leakage** | Jenerik hata mesajları (yanlış parola vs. bozuk veri ayrımı yapılmaz) |
+| **Server-side parola sızıntısı** | Parola asla saklanmaz, loglanmaz, veritabanına yazılmaz |
+| **Disk üzerinde plaintext** | Dosyalar yalnızca şifreli formda (.enc) saklanır |
+| **Unlimited download** | One-time download ve expiration desteği |
+
+### Kapsam Dışı (Out of Scope)
+
+| Konu | Açıklama |
+|------|----------|
+| Transport güvenliği | TLS/HTTPS reverse proxy (nginx) arkasında çalıştırılmalıdır |
+| Kullanıcı kimlik doğrulama | JWT/OAuth2 ile genişletilebilir (mevcut sürümde yok) |
+| Anahtar yönetimi | HSM/KMS entegrasyonu üretim ortamında değerlendirilmelidir |
+| Dosya silme | Soft-delete uygulanmıştır; güvenli disk silme (secure wipe) eklenmeli |
+
+---
+
+## ❓ Neden AES-GCM?
+
+### AES-GCM vs Alternatifler
+
+| Özellik | AES-GCM ✅ | AES-CBC | ChaCha20-Poly1305 |
+|---------|-----------|---------|-------------------|
+| Authenticated Encryption | ✅ Dahili | ❌ Ayrı MAC gerekir | ✅ Dahili |
+| NIST Onayı | ✅ | ✅ | ❌ (IETF standardı) |
+| Donanım Hızlandırma | ✅ AES-NI | ✅ AES-NI | ❌ (yazılım) |
+| Padding Oracle Saldırısı | ✅ Bağışık | ❌ Savunmasız | ✅ Bağışık |
+| Paralel İşleme | ✅ CTR mode | ❌ Sıralı | ✅ |
+
+**AES-GCM'i seçme nedenleri:**
+
+1. **AEAD (Authenticated Encryption with Associated Data):** Hem gizlilik hem bütünlük tek operasyonda sağlanır. CBC+HMAC gibi "encrypt-then-MAC" yaklaşımlarındaki implementasyon hatası riski ortadan kalkar.
+
+2. **Donanım hızlandırma:** Modern CPU'lardaki AES-NI ve CLMUL komut setleri sayesinde yazılım tabanlı alternatiflere göre 3-10x daha hızlıdır.
+
+3. **Endüstri standardı:** TLS 1.3, IPsec, SSH ve birçok kritik protokolde varsayılan şifreleme algoritmasıdır.
+
+4. **Padding oracle bağışıklığı:** GCM, CTR (Counter) modunu kullandığı için padding kavramı yoktur; bu nedenle padding oracle saldırılarına doğası gereği bağışıktır.
+
+> ⚠️ **Kritik Not:** AES-GCM'de nonce tekrarı (nonce reuse) felaket sonuçlar doğurur — hem gizlilik hem bütünlük kaybedilir. Bu nedenle VaultCore, her dosya için `os.urandom` ile kriptografik olarak güvenli benzersiz nonce üretir.
+
+---
+
+## ❓ Neden KDF (Key Derivation Function)?
+
+### Problemi Anlayalım
+
+Kullanıcılar genellikle düşük entropi parolalar kullanır (ör: `password123`). Bu parolaları doğrudan şifreleme anahtarı olarak kullanmak, saldırganın saniyede milyarlarca deneme yapmasına olanak tanır.
+
+### Argon2id Çözümü
+
+```
+Parola Entropisi:  ~40 bit  (zayıf)
+     │
+     ▼
+┌──────────────┐
+│  Argon2id    │
+│  KDF         │  ← 64 MB RAM × 3 iterasyon × 4 thread
+│              │  ← 16-byte benzersiz salt
+└──────┬───────┘
+       │
+       ▼
+AES Anahtarı:     256 bit (güçlü)
+```
+
+| Özellik | Argon2id ✅ | PBKDF2 | bcrypt | scrypt |
+|---------|-----------|--------|--------|--------|
+| Bellek Direnci | ✅ Yüksek | ❌ Yok | ❌ Düşük | ✅ Orta |
+| GPU Direnci | ✅ | ❌ | ⚠️ Kısmen | ✅ |
+| Side-channel Direnci | ✅ (id varyantı) | ⚠️ | ⚠️ | ❌ |
+| PHC Kazananı | ✅ (2015) | ❌ | ❌ | ❌ |
+| RFC | RFC 9106 | RFC 8018 | - | RFC 7914 |
+
+**Argon2id seçim nedenleri:**
+
+1. **Memory-hardness:** Her anahtar türetme işlemi 64 MB RAM gerektirir. GPU'lar sınırlı belleğe sahip olduğundan, paralel saldırı maliyeti dramatik olarak artar.
+
+2. **Hibrit tasarım (Argon2id):** Argon2**i** (data-independent, side-channel dirençli) ve Argon2**d** (data-dependent, GPU dirençli) varyantlarının birleşimidir.
+
+3. **Zamanlama:** OWASP tavsiye parametreleriyle (time=3, mem=64MB, par=4) her anahtar türetme ~250ms sürer. Bu, brute-force'u saniyede 4 denemeye düşürür.
+
+---
+
+## 📡 API Referansı
+
+### `POST /api/v1/vault/upload`
+
+Dosyayı şifreler ve kasada saklar.
+
+**Request:** `multipart/form-data`
+
+| Alan | Tip | Zorunlu | Açıklama |
+|------|-----|---------|----------|
+| `file` | File | ✅ | Şifrelenecek dosya |
+| `password` | string | ✅ | Şifreleme parolası |
+| `max_downloads` | int | ❌ | Maks indirme sayısı (1 = tek kullanımlık) |
+| `expires_in_hours` | int | ❌ | Dosya geçerlilik süresi (saat) |
+
+**Response: `201 Created`**
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "filename": "document.pdf",
+  "encrypted_size": 1048592,
+  "upload_date": "2026-09-17T10:00:00+00:00",
+  "message": "File encrypted and stored successfully",
+  "max_downloads": 1,
+  "expires_at": "2026-09-18T10:00:00+00:00"
+}
+```
+
+### `POST /api/v1/vault/download/{file_id}`
+
+Dosyayı çözer ve indirir.
+
+**Request:** `application/json`
+```json
+{
+  "password": "your_encryption_passphrase"
+}
+```
+
+**Response:** `200 OK` — Dosya içeriği (binary stream)
+
+**Hata Durumları:**
+| Kod | Durum | Açıklama |
+|-----|-------|----------|
+| 401 | Unauthorized | Yanlış parola veya bozuk veri |
+| 404 | Not Found | Dosya bulunamadı |
+| 410 | Gone | Dosya süresi dolmuş veya indirme limiti aşılmış |
+
+### `GET /api/v1/vault/files`
+
+Kasadaki dosyaların metadata listesini döner.
+
+**Response: `200 OK`**
+```json
+{
+  "files": [
+    {
+      "id": "a1b2c3d4-...",
+      "filename": "document.pdf",
+      "encrypted_size": 1048592,
+      "original_size": 1048576,
+      "content_type": "application/pdf",
+      "upload_date": "2026-09-17T10:00:00+00:00",
+      "download_count": 0,
+      "max_downloads": null,
+      "expires_at": null,
+      "is_available": true
+    }
+  ],
+  "total": 1
+}
+```
+
+> ⚠️ Bu endpoint **asla** parola, salt, nonce veya dosya içeriği döndürmez.
+
+---
+
+## 🚀 Kurulum
+
+### Docker ile (Önerilen)
+
+```bash
+# Projeyi klonla
+git clone https://github.com/YOUR_USERNAME/vaultcore.git
+cd vaultcore
+
+# .env dosyasını oluştur
+cp .env.example .env
+
+# Docker ile başlat (PostgreSQL dahil)
+docker-compose up --build -d
+
+# Servisin çalıştığını doğrula
+curl http://localhost:8000/health
+```
+
+### Manuel Kurulum
+
+```bash
+# Python 3.12+ gerekli
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# Bağımlılıkları yükle
+pip install -r requirements.txt
+
+# .env dosyasını oluştur ve PostgreSQL bağlantısını ayarla
+cp .env.example .env
+
+# Uygulamayı başlat
+python -m app.main
+```
+
+### Kullanım Örnekleri (cURL)
+
+```bash
+# Dosya yükle
+curl -X POST http://localhost:8000/api/v1/vault/upload \
+  -F "file=@secret_document.pdf" \
+  -F "password=my_strong_passphrase" \
+  -F "max_downloads=3" \
+  -F "expires_in_hours=24"
+
+# Dosya indir
+curl -X POST http://localhost:8000/api/v1/vault/download/{file_id} \
+  -H "Content-Type: application/json" \
+  -d '{"password": "my_strong_passphrase"}' \
+  --output decrypted_document.pdf
+
+# Dosya listesi
+curl http://localhost:8000/api/v1/vault/files
+```
+
+---
+
+## 🧪 Testler
+
+```bash
+# Tüm testleri çalıştır
+pytest
+
+# Detaylı çıktı ile
+pytest -v
+
+# Yalnızca kriptografik testler
+pytest tests/test_vault.py::TestEncryptDecrypt -v
+
+# Yalnızca API testleri
+pytest tests/test_vault.py::TestUploadEndpoint tests/test_vault.py::TestDownloadEndpoint -v
+
+# Coverage raporu
+pytest --cov=app --cov-report=html
+```
+
+### Test Kapsamı
+
+| Kategori | Testler |
+|----------|---------|
+| **Anahtar Türetme** | Deterministik çıktı, farklı parola/salt → farklı anahtar |
+| **Şifreleme/Çözme** | Roundtrip doğruluk, benzersiz salt/nonce, boş/büyük dosya |
+| **Güvenlik** | Yanlış parola → `InvalidTag`, manipüle veri → `InvalidTag` |
+| **API Upload** | Başarılı yükleme, boş dosya reddi, parametresiz red |
+| **API Download** | Doğru parola, yanlış parola (401), olmayan dosya (404) |
+| **One-Time Download** | İlk indirme → 200, ikinci indirme → 410 |
+| **Dosya Listesi** | Boş liste, metadata alanları, hassas veri sızıntısı kontrolü |
+| **Güvenlik Başlıkları** | X-Content-Type-Options, X-Frame-Options, HSTS |
+
+---
+
+## 📁 Proje Yapısı
+
+```
+vaultcore/
+├── app/
+│   ├── __init__.py              # Paket tanımı ve versiyon
+│   ├── main.py                  # FastAPI uygulama fabrikası
+│   ├── config.py                # Pydantic settings (env vars)
+│   ├── database.py              # Async SQLAlchemy yapılandırması
+│   ├── crypto/
+│   │   ├── __init__.py
+│   │   └── engine.py            # AES-256-GCM + Argon2id implementasyonu
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── dependencies.py      # Rate limiter ve DI bileşenleri
+│   │   └── routes.py            # REST endpoint tanımları
+│   ├── models/
+│   │   ├── __init__.py
+│   │   └── vault.py             # SQLAlchemy ORM modelleri
+│   └── services/
+│       ├── __init__.py
+│       └── vault_service.py     # İş mantığı katmanı
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py              # Test fixture'ları
+│   └── test_vault.py            # Kapsamlı test süiti
+├── encrypted_files/             # Şifreli dosya deposu (.enc)
+├── Dockerfile                   # Multi-stage production build
+├── docker-compose.yml           # PostgreSQL + App orkestrasyon
+├── requirements.txt             # Python bağımlılıkları
+├── pyproject.toml               # Pytest yapılandırması
+├── .env.example                 # Ortam değişkenleri şablonu
+├── .gitignore
+└── README.md                    # Bu dosya
+```
+
+---
+
+## 🔒 Güvenlik Politikaları
+
+### Uygulanan Güvenlik Önlemleri
+
+1. **Zero-Knowledge Tasarım:** Sunucu, kullanıcı parolasını hiçbir zaman saklamaz. Parola yalnızca istek süresince bellekte tutulur ve işlem sonrası scope'tan çıkar.
+
+2. **Jenerik Hata Mesajları:** Yanlış parola ve bozuk veri arasında ayrım yapılmaz. Bu, **oracle attack** vektörünü ortadan kaldırır.
+
+3. **Rate Limiting:** İndirme endpoint'i dakikada 5 deneme ile sınırlıdır. Bu, online brute-force saldırılarını pratik olarak imkansız kılar.
+
+4. **Güvenlik Başlıkları:** Tüm yanıtlarda `X-Content-Type-Options`, `X-Frame-Options`, `HSTS`, `CSP`, `Referrer-Policy` başlıkları ayarlanır.
+
+5. **Non-Root Container:** Docker imajı `vaultcore` kullanıcısı ile çalışır (root değil).
+
+6. **Minimal Attack Surface:** Üretim modunda Swagger/ReDoc belgeleri devre dışıdır.
+
+### Üretim Ortamı İçin Tavsiyeler
+
+- [ ] TLS/HTTPS için reverse proxy (nginx/Caddy) kullanın
+- [ ] `DATABASE_URL` içindeki parolayı güçlü bir değerle değiştirin
+- [ ] `ARGON2_MEMORY_COST` değerini sunucu kapasitesine göre artırın
+- [ ] Dosya boyut limitini (`MAX_FILE_SIZE_MB`) ihtiyaca göre ayarlayın
+- [ ] Log seviyesini `WARNING` olarak ayarlayın
+- [ ] Süresi dolmuş dosyalar için periyodik temizlik cron job'u ekleyin
+- [ ] WAF (Web Application Firewall) kullanın
+- [ ] Güvenlik denetimi (pentest) yaptırın
+
+---
+
+## 📄 Lisans
+
+MIT License — Detaylar için [LICENSE](LICENSE) dosyasına bakın.
+
+---
+
+<p align="center">
+  <sub>🛡 <em>VaultCore — Dosyalarınızı kriptografik güvence ile saklayın.</em></sub>
+</p>
