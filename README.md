@@ -1,6 +1,7 @@
-# 🔐 VaultCore: Password-Protected Encrypted File Storage Service
+# 🔐 Şifreli Dosya Kasası (VaultCore)
 
 <p align="center">
+  <em>Parola Korumalı, Şifreli Dosya Saklama Servisi</em><br>
   <strong>Endüstri Standardı Kriptografik Güvenlik ile Dosya Kasası Backend'i</strong>
 </p>
 
@@ -12,6 +13,56 @@
   <img src="https://img.shields.io/badge/Database-PostgreSQL-blue?logo=postgresql" alt="PostgreSQL">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
 </p>
+
+---
+
+## 🧭 Kısaca: Bu Proje Ne İşe Yarar?
+
+Dosyalarınızı **bir parolayla şifreleyip saklayan** bir sunucu servisidir.
+Yüklediğiniz dosya diske yalnızca şifreli hâlde yazılır ve parolanız hiçbir
+yere kaydedilmez. Sunucunun diskini ya da veritabanını ele geçiren biri
+parolayı bilmiyorsa dosyayı açamaz.
+
+Dosyayı yüklerken iki sınır koyabilirsiniz: **kaç kez indirilebileceği**
+(1 verilirse bağlantı tek kullanımlık olur) ve **kaç saat geçerli olacağı**.
+Süresi dolan dosyanın şifreli verisi diskten otomatik silinir. Parola tahmin
+etmeye çalışanlara karşı iki önlem var: IP başına deneme sınırı ve dosya
+kilidi. Aynı dosyaya art arda yanlış parola girilirse dosya bir süre
+kilitlenir.
+
+Bu proje bir **arka uç (API)** servisidir, kullanıcı arayüzü yoktur. `curl`,
+Postman ya da kendi uygulamanızla kullanılır.
+
+**Kimin işine yarar?** Hassas bir dosyayı süreli ve tek kullanımlık bir
+bağlantıyla paylaşmak isteyenlerin ve AES-GCM ile Argon2id'nin pratikte
+nasıl kullanıldığını görmek isteyen geliştiricilerin.
+
+| Siz verirsiniz | Servis size verir |
+|---|---|
+| Dosya + parola (en az 12 karakter) | Dosya kimliği (ID). Dosya diskte yalnızca şifreli durur |
+| (İsteğe bağlı) indirme sınırı ve geçerlilik süresi | Süre ya da sınır dolunca dosyanın kendiliğinden kapanması |
+| Dosya kimliği + doğru parola | Dosyanın çözülmüş, orijinal hâli |
+
+### ⚡ 3 Adımda Kullanım
+
+1. **Kurun ve başlatın:**
+   ```bash
+   cp .env.example .env      # içindeki tüm change-me değerlerini değiştirin
+   docker compose up --build -d
+   ```
+2. **Bir dosyayı en fazla bir kez indirilebilecek şekilde yükleyin:**
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/vault/upload \
+     -H "X-API-Key: $API_KEY" \
+     -F "file=@belge.pdf" -F "password=uzun-ve-guclu-parola" -F "max_downloads=1"
+   ```
+3. **Dönen `id` ile dosyayı indirin:**
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/vault/download/<id> \
+     -H "Content-Type: application/json" \
+     -d '{"password": "uzun-ve-guclu-parola"}' --output belge.pdf
+   ```
+   Aynı isteği ikinci kez gönderirseniz `410 Gone` döner, çünkü bağlantı tek kullanımlıktı.
 
 ---
 
@@ -292,8 +343,8 @@ Kaydı pasifleştirir ve şifreli dosyayı diskten siler. **`X-API-Key` gerekir.
 
 ```bash
 # Projeyi klonla
-git clone https://github.com/hasancrlk/vaultcore.git
-cd vaultcore
+git clone https://github.com/hasancrlk/sifreli-dosya-kasasi.git
+cd sifreli-dosya-kasasi
 
 # .env dosyasını oluştur
 cp .env.example .env   # tüm change-me değerlerini değiştir
@@ -382,7 +433,7 @@ pytest --cov=app --cov-report=html
 ## 📁 Proje Yapısı
 
 ```
-vaultcore/
+sifreli-dosya-kasasi/
 ├── app/
 │   ├── __init__.py              # Paket tanımı ve versiyon
 │   ├── main.py                  # FastAPI uygulama fabrikası
